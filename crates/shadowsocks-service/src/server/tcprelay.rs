@@ -1,11 +1,14 @@
-//! Shadowsocks TCP server
+
+use lazy_static::lazy_static;
+
 
 use std::{
     future::Future,
     io::{self, ErrorKind},
     net::SocketAddr,
     sync::Arc,
-    time::Duration,
+    time::{Duration, Instant},
+    collections::HashMap,
 };
 
 use log::{debug, error, info, trace, warn};
@@ -14,11 +17,14 @@ use shadowsocks::{
     net::{AcceptOpts, TcpStream as OutboundTcpStream},
     relay::tcprelay::{utils::copy_encrypted_bidirectional, ProxyServerStream},
     ProxyListener,
-    ServerConfig,
+    ServerConfig
 };
+use std::fs;
+
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::TcpStream as TokioTcpStream,
+    sync::Mutex,
     time,
 };
 
@@ -26,24 +32,97 @@ use crate::net::{utils::ignore_until_end, MonProxyStream};
 
 use super::context::ServiceContext;
 
-/// TCP server instance
+use rdkafka::producer::{FutureProducer, FutureRecord};
+use rdkafka::config::ClientConfig;
+use get_if_addrs::{get_if_addrs, IfAddr};
+
+
+use serde::{Serialize, Deserialize};
+
+
+use std::collections::HashSet;
+
+
+
+#[derive(Deserialize, Debug)]
+struct CloudConfig {
+    bootstrap_servers: String,
+    security_protocol: String,
+    sasl_mechanisms: String,
+    sasl_username: String,
+    sasl_password: String,
+    session_timeout_ms: String,
+    iface: String,
+}
+
+lazy_static! {
+    // Globally accessible CloudConfig
+    static ref CONFIG: CloudConfig = read_cloud_config();
+}
+
+fn read_cloud_config() -> CloudConfig {
+    let config_str = fs::read_to_string("cloud.json")
+        .expect("Failed to read cloud.json");
+    serde_json::from_str(&config_str)
+        .expect("Failed to parse cloud.json")
+}
+
+
 pub struct TcpServer {
     context: Arc<ServiceContext>,
     svr_cfg: ServerConfig,
     listener: ProxyListener,
+    active_connections: Arc<Mutex<HashMap<u16, Instant>>>,
+    kafka_producer: FutureProducer,
 }
 
-impl TcpServer {
+fn get_ip(interface: &str) -> Option<String> {
+    if let Ok(addresses) = get_if_addrs() {
+        for iface in addresses {
+            if iface.name == interface {
+                if let IfAddr::V6(v6) = iface.addr {
+                    return Some(v6.ip.to_string());
+                }
+                if let IfAddr::V4(v4) = iface.addr {
+                    return Some(v4.ip.to_string());
+                }
+            }
+        }
+    }
+    None
+}
+
+fn create_kafka_producer() -> FutureProducer {
+    let producer: FutureProducer = ClientConfig::new()
+        .set("bootstrap.servers", &CONFIG.bootstrap_servers)
+        .set("security.protocol", &CONFIG.security_protocol)
+        .set("sasl.mechanisms", &CONFIG.sasl_mechanisms)
+        .set("sasl.username", &CONFIG.sasl_username)
+        .set("sasl.password", &CONFIG.sasl_password)
+        .set("session.timeout.ms", &CONFIG.session_timeout_ms)
+        .create()
+        .expect("Kafka producer creation failed");
+
+    producer
+}
+
+impl TcpServer {    
+
     pub(crate) async fn new(
         context: Arc<ServiceContext>,
         svr_cfg: ServerConfig,
-        accept_opts: AcceptOpts,
+        accept_opts: AcceptOpts
     ) -> io::Result<TcpServer> {
         let listener = ProxyListener::bind_with_opts(context.context(), &svr_cfg, accept_opts).await?;
+
+        let producer = create_kafka_producer();
+
         Ok(TcpServer {
             context,
             svr_cfg,
             listener,
+            active_connections: Arc::new(Mutex::new(HashMap::new())),
+            kafka_producer: producer,
         })
     }
 
@@ -57,13 +136,69 @@ impl TcpServer {
         self.listener.local_addr()
     }
 
-    /// Start server's accept loop
     pub async fn run(self) -> io::Result<()> {
+        let server_addr = self.listener.local_addr().expect("listener.local_addr");
+        let server_port = server_addr.port();
+
+        let iface = &CONFIG.iface;
+        let ip=get_ip(iface).expect("eth0 interface is expected to either have an assigned ipv6 or ipv4 address"); //"8.8.8.8";
+        let ip_clone = ip.clone();
+
         info!(
-            "shadowsocks tcp server listening on {}, inbound address {}",
-            self.listener.local_addr().expect("listener.local_addr"),
+            "shadowsocks tcp server listening on port {}, inbound address {}",
+            server_port,
             self.svr_cfg.addr()
         );
+
+        let active_connections = self.active_connections.clone();
+        let active_connections_for_spawn = active_connections.clone();
+
+        tokio::spawn({
+            let active_connections = active_connections_for_spawn.clone();
+            let kafka_producer = self.kafka_producer.clone();
+            async move {
+                let mut interval = time::interval(Duration::from_secs(60));
+                loop {
+                    interval.tick().await;
+                    let mut dropped_connections = Vec::new();
+                    {
+                        let mut connections = active_connections.lock().await;
+                        connections.retain(|&port, last_active| {
+                            if last_active.elapsed() < Duration::from_secs(60) {
+                                true
+                            } else {
+                                dropped_connections.push(port);
+                                false
+                            }
+                        });
+                    }
+
+                    for port in dropped_connections {
+                        // let message = format!("Dropped {}:{}", ip_clone, port);
+                        let message = format!(r#"{{"event": "dropped", "ip": "{}", "port": {}}}"#, ip_clone, port);
+
+                        info!("{}", &message);
+                    
+                        // Clone kafka_producer for each iteration of the loop
+                        let kafka_producer = kafka_producer.clone();
+                    
+                        // Using Tokio's spawn to not wait for the future to complete.
+                        tokio::spawn(async move {
+                            match kafka_producer.send(
+                                FutureRecord::<(), String>::to("ports").payload(&message),
+                                Duration::from_secs(0),
+                            ).await {
+                                Ok(_) => info!("Message sent successfully to Kafka"),
+                                Err(e) => {
+                                    println!("Failed to send message to Kafka: {:?}", e);
+                                },
+                            }
+                        });
+                    }
+                }
+            }
+        });
+
 
         loop {
             let flow_stat = self.context.flow_stat();
@@ -81,10 +216,37 @@ impl TcpServer {
                 }
             };
 
-            if self.context.check_client_blocked(&peer_addr) {
-                warn!("access denied from {} by ACL rules", peer_addr);
-                continue;
+            {
+                let mut connections = active_connections.lock().await;
+                if connections.insert(server_port, Instant::now()).is_none() {
+                    // let message = format!("Created {}:{}", ip, server_port);
+                    let message = format!(r#"{{"event": "consumed", "ip": "{}", "port": {}}}"#, ip, server_port);
+
+
+                    info!("{}", &message);
+            
+                    // Clone the necessary data to be moved into the async block
+                    let kafka_producer = self.kafka_producer.clone();
+            
+                    // Using Tokio's spawn to not wait for the future to complete.
+                    tokio::spawn(async move {
+                        match kafka_producer.send(
+                            FutureRecord::<(), String>::to("ports").payload(&message),
+                            Duration::from_secs(0),
+                        ).await {
+                            Ok(_) => info!("Message sent successfully to Kafka"),
+                            Err(e) => {
+                                // Directly printing the error for testing purposes
+                                println!("Failed to send message to Kafka: {:?}", e);
+                            },
+                        }
+                    });
+                }
             }
+            
+            
+
+            // let active_connections_clone = active_connections.clone();
 
             let client = TcpServerClient {
                 context: self.context.clone(),
@@ -96,8 +258,15 @@ impl TcpServer {
 
             tokio::spawn(async move {
                 if let Err(err) = client.serve().await {
-                    debug!("tcp server stream aborted with error: {}", err);
+                    debug!("tcp server stream for {} aborted with error: {}", peer_addr, err);
+                    // info!("tcp client disconnected from {}", server_addr);
+                } else {
+                    // If there's no error, log a normal disconnection message
+                    // info!("tcp client disconnected from {}", server_addr);
                 }
+
+                // Remove connection from active list
+                // active_connections_clone.lock().await.remove(&peer_addr);
             });
         }
     }

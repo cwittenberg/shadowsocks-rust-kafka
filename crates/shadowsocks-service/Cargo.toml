@@ -176,6 +176,15 @@ smoltcp = { version = "0.11", optional = true, default-features = false, feature
 serde = { version = "1.0", features = ["derive"] }
 json5 = "0.4"
 
+
+#Kafka integration dependencies
+serde_json = "1.0"
+lazy_static = "1.4"
+rdkafka = {version = "0.36.0", features = ["ssl"] }
+get_if_addrs = "0.5.3"
+
+
+
 shadowsocks = { version = "1.17.2", path = "../shadowsocks", default-features = false }
 
 # Just for the ioctl call macro
